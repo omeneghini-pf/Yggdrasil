@@ -2,6 +2,18 @@ cmake_minimum_required(VERSION 3.18)
 
 project(vmecpp_julia CXX)
 
+# macOS compatibility flags for BinaryBuilder darwin14 sysroot (C++20 on old libc++)
+# The darwin14 libc++ is missing several C++20 features:
+# - std::construct_at: provided via construct_at_compat.h
+# - <numbers> header: provided via compat_headers/numbers
+# - std::optional::value(): enabled via _LIBCPP_DISABLE_AVAILABILITY
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  message(STATUS "macOS detected: adding libc++ compatibility flags for Julia wrapper")
+  add_compile_options(-isystem /workspace/srcdir/compat_headers)
+  add_compile_options(-include /workspace/srcdir/compat_headers/construct_at_compat.h)
+  add_compile_definitions(_LIBCPP_DISABLE_AVAILABILITY)
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

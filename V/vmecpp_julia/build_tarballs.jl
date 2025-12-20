@@ -130,12 +130,76 @@ sed -i 's/"-maes"//g' abseil-cpp/abseil-cpp/absl/copts/GENERATED_AbseilCopts.cma
 sed -i 's/"-msse4.1"//g' abseil-cpp/abseil-cpp/absl/copts/GENERATED_AbseilCopts.cmake
 sed -i 's/"-mfpu=neon"//g' abseil-cpp/abseil-cpp/absl/copts/GENERATED_AbseilCopts.cmake
 
-# On macOS, the old libc++ doesn't fully support C++20 three-way comparison operators
-# Build Abseil with C++17 on macOS to avoid std::strong_ordering issues
-ABSEIL_CXX_STANDARD=20
+# On macOS, the old libc++ (darwin14) doesn't fully support C++20 features:
+# 1. std::strong_ordering comparison operators are broken
+# 2. <numbers> header (std::numbers::sqrt2 etc.) doesn't exist
+# 3. std::construct_at doesn't exist
+# We patch around these issues below
 if [[ "${target}" == *-apple-* ]]; then
-    echo "macOS detected: using C++17 for Abseil to avoid libc++ three-way comparison issues"
-    ABSEIL_CXX_STANDARD=17
+    echo "macOS detected: applying libc++ compatibility patches"
+
+    # 1. Undefine __cpp_impl_three_way_comparison at the start of time.h
+    #    This prevents Abseil from using the broken spaceship operator comparisons
+    sed -i '1i #undef __cpp_impl_three_way_comparison' abseil-cpp/abseil-cpp/absl/time/time.h
+
+    # 2. Create compatibility headers for vmecpp
+    #    The darwin14 libc++ doesn't have these C++20 features
+    mkdir -p compat_headers
+
+    # 2a. <numbers> header with mathematical constants
+    cat > compat_headers/numbers << 'NUMBERS_EOF'
+// C++20 <numbers> compatibility header for old libc++
+#pragma once
+#include <cmath>
+namespace std {
+namespace numbers {
+    inline constexpr double e          = 2.718281828459045235360287471352662;
+    inline constexpr double log2e      = 1.442695040888963407359924681001892;
+    inline constexpr double log10e     = 0.434294481903251827651128918916605;
+    inline constexpr double pi         = 3.141592653589793238462643383279503;
+    inline constexpr double inv_pi     = 0.318309886183790671537767526745029;
+    inline constexpr double inv_sqrtpi = 0.564189583547756286948079451560773;
+    inline constexpr double ln2        = 0.693147180559945309417232121458177;
+    inline constexpr double ln10       = 2.302585092994045684017991454684364;
+    inline constexpr double sqrt2      = 1.414213562373095048801688724209698;
+    inline constexpr double sqrt3      = 1.732050807568877293527446341505872;
+    inline constexpr double inv_sqrt3  = 0.577350269189625764509148780501958;
+    inline constexpr double egamma     = 0.577215664901532860606512090082402;
+    inline constexpr double phi        = 1.618033988749894848204586834365638;
+}
+}
+NUMBERS_EOF
+    echo "Created compat_headers/numbers"
+
+    # 2b. construct_at_compat.h - provides std::construct_at for C++20 compatibility
+    #     This header is force-included via -include flag
+    #     It also ensures <optional> is included early to prevent Abseil's optional from shadowing std::optional
+    cat > compat_headers/construct_at_compat.h << 'CONSTRUCT_AT_EOF'
+// C++20 std::construct_at compatibility header for old libc++
+// This provides std::construct_at which is missing in darwin14 libc++
+// Also ensures std::optional is properly available before any Abseil headers
+#pragma once
+
+// Include <optional> early so it gets processed before Abseil's optional.h
+// This prevents "no template named 'optional' in namespace 'std'" errors
+#include <optional>
+
+#include <memory>
+#include <utility>
+#include <new>
+
+// Only define if not already available (check for C++20 feature macro)
+#if !defined(__cpp_lib_constexpr_dynamic_alloc) || __cpp_lib_constexpr_dynamic_alloc < 201907L
+namespace std {
+template<typename T, typename... Args>
+constexpr T* construct_at(T* p, Args&&... args) {
+    return ::new (const_cast<void*>(static_cast<const volatile void*>(p)))
+        T(std::forward<Args>(args)...);
+}
+} // namespace std
+#endif
+CONSTRUCT_AT_EOF
+    echo "Created compat_headers/construct_at_compat.h"
 fi
 
 mkdir -p abseil-build && cd abseil-build
@@ -145,7 +209,7 @@ cmake ../abseil-cpp/abseil-cpp \
     -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
-    -DCMAKE_CXX_STANDARD=${ABSEIL_CXX_STANDARD} \
+    -DCMAKE_CXX_STANDARD=20 \
     -DABSL_PROPAGATE_CXX_STD=ON \
     -DABSL_BUILD_TESTING=OFF
 make -j${nproc}
@@ -164,26 +228,49 @@ sed -i '/pybind11_add_module/,/install.*_vmecpp/d' vmecpp/CMakeLists.txt
 # Also remove install target for indata2json (we only build vmecpp_core)
 sed -i '/install.*TARGETS.*indata2json/d' vmecpp/CMakeLists.txt
 
-mkdir -p vmecpp-build && cd vmecpp-build
-
-# On macOS, disable Abseil's three-way comparison to avoid libc++ issues
-# This needs to be passed to vmecpp's cmake because it FetchContent's Abseil
-VMECPP_CXX_FLAGS=""
+# On macOS, patch vmecpp CMakeLists.txt to add libc++ compatibility flags
+# IMPORTANT: Must add after project() because CMAKE_SYSTEM_NAME is not set until then
 if [[ "${target}" == *-apple-* ]]; then
-    echo "macOS detected: disabling three-way comparison for vmecpp's Abseil"
-    VMECPP_CXX_FLAGS="-DABSL_INTERNAL_HAVE_THREE_WAY_COMPARE=0"
+    echo "Patching vmecpp CMakeLists.txt for macOS compatibility..."
+    # Add compile options AFTER the project() line (when CMAKE_SYSTEM_NAME is set)
+    # The toolchain file is processed during project(), so we can check CMAKE_SYSTEM_NAME after
+    # Flags:
+    #   -isystem: Add compat_headers to search path for <numbers> header
+    #   -include: Force-include construct_at_compat.h to provide std::construct_at
+    #   _LIBCPP_DISABLE_AVAILABILITY: Allow std::optional::value() on macOS 10.10
+    sed -i '/^project(vmecpp/a \
+\
+# macOS compatibility flags for BinaryBuilder darwin14 sysroot (C++20 on old libc++)\
+# CMAKE_SYSTEM_NAME is only available after project() is called\
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")\
+  message(STATUS "macOS detected: adding libc++ compatibility flags")\
+  add_compile_options(-isystem /workspace/srcdir/compat_headers)\
+  add_compile_options(-include /workspace/srcdir/compat_headers/construct_at_compat.h)\
+  add_compile_definitions(_LIBCPP_DISABLE_AVAILABILITY)\
+endif()' vmecpp/CMakeLists.txt
+    echo "Patched vmecpp CMakeLists.txt - showing relevant section:"
+    head -30 vmecpp/CMakeLists.txt
 fi
+
+mkdir -p vmecpp-build && cd vmecpp-build
 
 # Configure vmecpp with vendored dependencies
 # Set BLAS/LAPACK to use OpenBLAS from JLL
 # Note: FetchContent variable names use the EXACT name from FetchContent_Declare
 # For packages with hyphens, CMake converts them to underscores in cache variables
 # BUT we also need to try the hyphenated form for compatibility
+
+# Set macOS-specific cmake flags
+MACOS_CXX_FLAGS=""
+if [[ "${target}" == *-apple-* ]]; then
+    MACOS_CXX_FLAGS="-isystem /workspace/srcdir/compat_headers -D_LIBCPP_DISABLE_AVAILABILITY"
+    echo "macOS: Adding extra CXX flags: ${MACOS_CXX_FLAGS}"
+fi
+
 cmake ../vmecpp \
     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TARGET_TOOLCHAIN} \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_STANDARD=20 \
-    -DCMAKE_CXX_FLAGS="${VMECPP_CXX_FLAGS}" \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DFETCHCONTENT_SOURCE_DIR_EIGEN=${WORKSPACE}/srcdir/eigen/eigen \
     -DFETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON=${WORKSPACE}/srcdir/nlohmann_json/json \
@@ -232,7 +319,13 @@ filter!(p -> arch(p) != "armv7l", platforms)  # ARM32 often problematic
 filter!(p -> arch(p) != "armv6l", platforms)  # Experimental
 filter!(p -> !Sys.iswindows(p), platforms)    # Windows not supported yet
 filter!(p -> !Sys.isfreebsd(p), platforms)    # FreeBSD not tested
-filter!(p -> !Sys.isapple(p), platforms)      # macOS: libc++ (darwin14) lacks C++20 <compare> support
+# macOS: darwin14 SDK (macOS 10.10) has old libc++ missing C++17 runtime symbols:
+#   - std::filesystem (used by file_io.cc, mgrid_provider.cc)
+#   - std::bad_optional_access (thrown by .value() in vmec_indata.cc)
+# Compile-time workarounds for <numbers>, std::construct_at, and spaceship operator
+# are in place and will work when BinaryBuilder supports a newer macOS SDK.
+# TODO: Re-enable macOS when darwin17+ (macOS 10.13+) SDK becomes available
+filter!(p -> !Sys.isapple(p), platforms)
 filter!(p -> arch(p) != "i686", platforms)    # i686: 32-bit not needed
 filter!(p -> arch(p) != "powerpc64le", platforms)  # ppc64le: not a target platform
 
