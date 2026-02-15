@@ -341,8 +341,6 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod)
   wout.method("rbtor0", [](const vmecpp::WOutFileContents& w) { return w.rbtor0; });
   wout.method("fsqr", [](const vmecpp::WOutFileContents& w) { return w.fsqr; });
   wout.method("ftolv", [](const vmecpp::WOutFileContents& w) { return w.ftolv; });
-  wout.method("Aminor_p", [](const vmecpp::WOutFileContents& w) { return w.Aminor_p; });
-  wout.method("Rmajor_p", [](const vmecpp::WOutFileContents& w) { return w.Rmajor_p; });
 
   // Scalar outputs - integers
   wout.method("ns", [](const vmecpp::WOutFileContents& w) { return w.ns; });
@@ -398,35 +396,54 @@ JLCXX_MODULE define_julia_module(jlcxx::Module& mod)
   wout.method("bsubumns", [](const vmecpp::WOutFileContents& w) { return w.bsubumns; });
   wout.method("bsubvmns", [](const vmecpp::WOutFileContents& w) { return w.bsubvmns; });
 
-  // Threed1GeometricAndMagneticQuantities - geometric quantities
-  mod.add_type<vmecpp::Threed1GeometricAndMagneticQuantities>("Threed1GeometricAndMagneticQuantities")
-    .method("surf_area_p", [](const vmecpp::Threed1GeometricAndMagneticQuantities& g) { return g.surf_area_p; })
-    .method("cross_area_p", [](const vmecpp::Threed1GeometricAndMagneticQuantities& g) { return g.cross_area_p; })
-    .method("volume_p", [](const vmecpp::Threed1GeometricAndMagneticQuantities& g) { return g.volume_p; })
-    .method("Rmajor_p", [](const vmecpp::Threed1GeometricAndMagneticQuantities& g) { return g.Rmajor_p; })
-    .method("Aminor_p", [](const vmecpp::Threed1GeometricAndMagneticQuantities& g) { return g.Aminor_p; })
-    .method("aspect", [](const vmecpp::Threed1GeometricAndMagneticQuantities& g) { return g.aspect; })
-    .method("circum_p", [](const vmecpp::Threed1GeometricAndMagneticQuantities& g) { return g.circum_p; })
-    .method("kappa_p", [](const vmecpp::Threed1GeometricAndMagneticQuantities& g) { return g.kappa_p; });
+  // Jacobian (sqrt_g) Fourier coefficients (needed for accurate gradient calculations in NGS pellet model)
+  wout.method("gmnc", [](const vmecpp::WOutFileContents& w) { return w.gmnc; });
+  wout.method("gmns", [](const vmecpp::WOutFileContents& w) { return w.gmns; });
 
   // JxBOutFileContents - force diagnostics
   mod.add_type<vmecpp::JxBOutFileContents>("JxBOutFileContents")
     .method("bdotk", [](const vmecpp::JxBOutFileContents& j) { return j.bdotk; })
     .method("avforce", [](const vmecpp::JxBOutFileContents& j) { return j.avforce; });
 
-  // MercierFileContents - stability analysis
+  // MercierFileContents - stability analysis (full Mercier criterion data)
   mod.add_type<vmecpp::MercierFileContents>("MercierFileContents")
+    // Radial coordinate
     .method("s", [](const vmecpp::MercierFileContents& m) { return m.s; })
-    .method("iota", [](const vmecpp::MercierFileContents& m) { return m.iota; });
+    .method("toroidal_flux", [](const vmecpp::MercierFileContents& m) { return m.toroidal_flux; })
+    // Profile quantities
+    .method("iota", [](const vmecpp::MercierFileContents& m) { return m.iota; })
+    .method("shear", [](const vmecpp::MercierFileContents& m) { return m.shear; })
+    .method("d_volume_d_s", [](const vmecpp::MercierFileContents& m) { return m.d_volume_d_s; })
+    .method("well", [](const vmecpp::MercierFileContents& m) { return m.well; })
+    .method("toroidal_current", [](const vmecpp::MercierFileContents& m) { return m.toroidal_current; })
+    .method("d_toroidal_current_d_s", [](const vmecpp::MercierFileContents& m) { return m.d_toroidal_current_d_s; })
+    .method("pressure", [](const vmecpp::MercierFileContents& m) { return m.pressure; })
+    .method("d_pressure_d_s", [](const vmecpp::MercierFileContents& m) { return m.d_pressure_d_s; })
+    // Mercier criterion components: D_Merc = D_shear + D_curr + D_well + D_geod
+    .method("DMerc", [](const vmecpp::MercierFileContents& m) { return m.DMerc; })
+    .method("Dshear", [](const vmecpp::MercierFileContents& m) { return m.Dshear; })
+    .method("Dwell", [](const vmecpp::MercierFileContents& m) { return m.Dwell; })
+    .method("Dcurr", [](const vmecpp::MercierFileContents& m) { return m.Dcurr; })
+    .method("Dgeod", [](const vmecpp::MercierFileContents& m) { return m.Dgeod; });
 
   // OutputQuantities - main result container
   mod.add_type<vmecpp::OutputQuantities>("OutputQuantities")
     .method("wout", [](vmecpp::OutputQuantities& o) -> vmecpp::WOutFileContents& { return o.wout; })
     .method("jxbout", [](vmecpp::OutputQuantities& o) -> vmecpp::JxBOutFileContents& { return o.jxbout; })
-    .method("mercier", [](vmecpp::OutputQuantities& o) -> vmecpp::MercierFileContents& { return o.mercier; })
-    .method("threed1_geometric_magnetic", [](vmecpp::OutputQuantities& o) -> vmecpp::Threed1GeometricAndMagneticQuantities& {
-      return o.threed1_geometric_magnetic;
-    });
+    .method("mercier", [](vmecpp::OutputQuantities& o) -> vmecpp::MercierFileContents& { return o.mercier; });
+
+  // Save/Load OutputQuantities to/from HDF5 file
+  mod.method("save_output_quantities", [](const vmecpp::OutputQuantities& o, const std::string& path) {
+    auto status = o.Save(std::filesystem::path(path));
+    if (!status.ok()) {
+      jl_error(status.message().data());
+    }
+  });
+
+  mod.method("load_output_quantities", [](const std::string& path) -> vmecpp::OutputQuantities {
+    auto result = vmecpp::OutputQuantities::Load(std::filesystem::path(path));
+    return GetValueOrThrow(result);
+  });
 
   // HotRestartState
   mod.add_type<vmecpp::HotRestartState>("HotRestartState");

@@ -23,7 +23,11 @@ uuidpkg = Base.UUID("44cfe95a-1eb2-52ea-b672-e2afdf69b78f")
 for v in [v"1.12.0", v"1.13.0"]
     stdlibs = Pkg.Types.get_last_stdlibs(v)
     if haskey(stdlibs, uuidpkg)
-        empty!(stdlibs[uuidpkg].weakdeps)
+        stdlib_entry = stdlibs[uuidpkg]
+        # Only try to empty weakdeps if the entry has that field (Julia version dependent)
+        if hasproperty(stdlib_entry, :weakdeps)
+            empty!(stdlib_entry.weakdeps)
+        end
     end
 end
 
@@ -34,7 +38,7 @@ include("../../L/libjulia/common.jl")
 filter!(v -> (v.major, v.minor) in [(1, 11), (1, 12)], julia_versions)
 
 name = "vmecpp_julia"
-version = v"0.4.11"
+version = v"0.4.13"
 
 # julia_compat string for build_tarballs
 julia_compat = libjulia_julia_compat(julia_versions)
@@ -198,6 +202,28 @@ cd ..
 # ============================================
 # Step 3: Build Julia wrapper (shared library)
 # ============================================
+
+# Fix libcxxwrap_julia libjulia linkage BEFORE building the wrapper.
+# BinaryBuilder's libcxxwrap_julia_jll links against libjulia.1.11 even for Julia 1.12 platforms.
+# When the linker links vmecpp_julia against libcxxwrap_julia, it picks up the wrong libjulia
+# soname reference. Fix this by patching libcxxwrap_julia in the prefix before building.
+if [[ "${bb_full_target}" == *"julia_version+1.12"* ]]; then
+    echo "Patching libcxxwrap_julia libjulia reference for Julia 1.12..."
+    if [[ "${target}" == *"-apple-"* ]]; then
+        for lib in ${prefix}/lib/libcxxwrap_julia*.dylib; do
+            echo "  Patching $lib"
+            install_name_tool -change @rpath/libjulia.1.11.dylib @rpath/libjulia.1.12.dylib "$lib" 2>/dev/null || true
+            install_name_tool -change libjulia.1.11.dylib @rpath/libjulia.1.12.dylib "$lib" 2>/dev/null || true
+        done
+    else
+        for lib in ${prefix}/lib/libcxxwrap_julia*.so*; do
+            echo "  Patching $lib"
+            patchelf --replace-needed libjulia.so.1.11 libjulia.so.1.12 "$lib" 2>/dev/null || true
+        done
+    fi
+    echo "libcxxwrap_julia patched."
+fi
+
 echo "Building Julia wrapper..."
 # Note: DirectorySource("./bundled") copies contents to srcdir root, not to srcdir/bundled/
 # So the CMakeLists.txt and vmecpp_julia.cpp are at ${WORKSPACE}/srcdir/
@@ -215,6 +241,27 @@ cmake .. \
     -Dabsl_DIR=${prefix}/lib/cmake/absl
 make -j${nproc}
 make install
+
+# Post-build: verify and fix libvmecpp_julia libjulia linkage for Julia 1.12
+if [[ "${bb_full_target}" == *"julia_version+1.12"* ]]; then
+    echo "=== Post-build linkage check for Julia 1.12 ==="
+    if [[ "${target}" == *"-apple-"* ]]; then
+        echo "otool BEFORE fix:"
+        otool -L ${prefix}/lib/libvmecpp_julia.dylib 2>/dev/null | grep -i julia || true
+        # Fix any remaining libjulia.1.11 references
+        install_name_tool -change @rpath/libjulia.1.11.dylib @rpath/libjulia.1.12.dylib ${prefix}/lib/libvmecpp_julia.dylib 2>/dev/null || true
+        install_name_tool -change libjulia.1.11.dylib @rpath/libjulia.1.12.dylib ${prefix}/lib/libvmecpp_julia.dylib 2>/dev/null || true
+        echo "otool AFTER fix:"
+        otool -L ${prefix}/lib/libvmecpp_julia.dylib 2>/dev/null | grep -i julia || true
+    else
+        echo "readelf BEFORE fix:"
+        readelf -d ${prefix}/lib/libvmecpp_julia.so 2>/dev/null | grep -i julia || true
+        patchelf --replace-needed libjulia.so.1.11 libjulia.so.1.12 ${prefix}/lib/libvmecpp_julia.so 2>/dev/null || true
+        echo "readelf AFTER fix:"
+        readelf -d ${prefix}/lib/libvmecpp_julia.so 2>/dev/null | grep -i julia || true
+    fi
+    echo "=== End linkage check ==="
+fi
 
 # Install license
 install_license ${WORKSPACE}/srcdir/vmecpp/LICENSE.txt
@@ -240,6 +287,10 @@ filter!(p -> arch(p) != "powerpc64le", platforms)  # ppc64le: not a target platf
 # Expand C++ string ABIs
 platforms = expand_cxxstring_abis(platforms)
 
+# Only build for CI targets: aarch64 macOS + x86_64 Linux glibc
+filter!(p -> (arch(p) == "aarch64" && Sys.isapple(p)) ||
+             (arch(p) == "x86_64" && Sys.islinux(p) && libc(p) == "glibc"), platforms)
+
 # Products
 products = [
     # RTLD_GLOBAL is required for CxxWrap-based Julia bindings to properly expose
@@ -252,7 +303,7 @@ products = [
 # Dependencies
 dependencies = [
     # Build dependencies
-    BuildDependency(PackageSpec(;name="libjulia_jll", version="1.11.0")),
+    BuildDependency("libjulia_jll"),
     BuildDependency("Eigen_jll"),
 
     # Runtime dependencies
